@@ -6,6 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+if float(torch.version.cuda) > 10.1:
+    from dg_tutel import moe as tutel_moe
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -33,11 +36,15 @@ class Bottleneck(nn.Module):
 
         if stride > 1 or inplanes != planes * Bottleneck.expansion:
             # downsampling layer is prepended with an avgpool, and the subsequent convolution has stride 1
-            self.downsample = nn.Sequential(OrderedDict([
-                ("-1", nn.AvgPool2d(stride)),
-                ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
-                ("1", nn.BatchNorm2d(planes * self.expansion))
-            ]))
+            self.downsample = nn.Sequential(
+                OrderedDict(
+                    [
+                        ("-1", nn.AvgPool2d(stride)),
+                        ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
+                        ("1", nn.BatchNorm2d(planes * self.expansion)),
+                    ]
+                )
+            )
 
     def forward(self, x: torch.Tensor):
         identity = x
@@ -58,7 +65,7 @@ class Bottleneck(nn.Module):
 class AttentionPool2d(nn.Module):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
-        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
+        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim**2 + 1, embed_dim) / embed_dim**0.5)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
@@ -70,7 +77,9 @@ class AttentionPool2d(nn.Module):
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
         x, _ = F.multi_head_attention_forward(
-            query=x[:1], key=x, value=x,
+            query=x[:1],
+            key=x,
+            value=x,
             embed_dim_to_check=x.shape[-1],
             num_heads=self.num_heads,
             q_proj_weight=self.q_proj.weight,
@@ -86,7 +95,7 @@ class AttentionPool2d(nn.Module):
             out_proj_bias=self.c_proj.bias,
             use_separate_proj_weight=True,
             training=self.training,
-            need_weights=False
+            need_weights=False,
         )
         return x.squeeze(0)
 
@@ -169,16 +178,39 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+    def __init__(
+        self,
+        d_model: int,
+        n_head: int,
+        attn_mask: torch.Tensor = None,
+        moe_layers: list = None,
+        cur_depth: int = 0,
+        router: str = "cosine_top",
+        num_experts: int = 6,
+    ):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
-        self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
-        ]))
+        self.cur_layer_type = moe_layers[cur_depth] if moe_layers is not None else "F"
+        self.aux_loss_weights = 0.01
+        self.aux_loss = None
+        self.moe_drop = nn.Dropout(0.1)
+        if self.cur_layer_type == "S":
+            self.mlp = tutel_moe.moe_layer(
+                gate_type={"type": router, "k": 1, "fp32_gate": True, "gate_noise": 1.0, "capacity_factor": 1.5},
+                experts={
+                    "type": "ffn",
+                    "count_per_node": num_experts,
+                    "hidden_size_per_expert": d_model * 4,
+                    "activation_fn": lambda x: self.moe_drop(F.gelu(x)),
+                },
+                model_dim=d_model,
+                batch_prioritized_routing=True,
+                is_gshard_loss=False,
+            )
+        elif self.cur_layer_type == "F":
+            self.mlp = nn.Sequential(OrderedDict([("c_fc", nn.Linear(d_model, d_model * 4)), ("gelu", QuickGELU()), ("c_proj", nn.Linear(d_model * 4, d_model))]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
@@ -189,6 +221,8 @@ class ResidualAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
+        if self.cur_layer_type == "S":
+            self.aux_loss = self.mlp.l_aux * self.aux_loss_weights
         return x
 
 
@@ -210,7 +244,7 @@ class VisionTransformer(nn.Module):
         self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
-        scale = width ** -0.5
+        scale = width**-0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
@@ -240,51 +274,93 @@ class VisionTransformer(nn.Module):
         return x
 
 
+class MoETransformer(nn.Module):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, moe_layers: list = None):
+        super().__init__()
+        self.width = width
+        self.layers = layers
+        self.resblocks = nn.Sequential(
+            *[ResidualAttentionBlock(d_model=width, n_head=heads, attn_mask=attn_mask, moe_layers=moe_layers, num_experts=6, cur_depth=idx) for idx in range(layers)]
+        )
+
+    def forward(self, x: torch.Tensor):
+        return self.resblocks(x)
+
+
+class MoEVisionTransformer(nn.Module):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, moe_layers: list = None):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+
+        scale = width**-0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = MoETransformer(width=width, layers=layers, heads=heads, moe_layers=moe_layers)
+
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+    def forward(self, x: torch.Tensor):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        x = self.ln_post(x[:, 0, :])
+
+        if self.proj is not None:
+            x = x @ self.proj
+
+        return x
+
+
 class CLIP(nn.Module):
-    def __init__(self,
-                 embed_dim: int,
-                 # vision
-                 image_resolution: int,
-                 vision_layers: Union[Tuple[int, int, int, int], int],
-                 vision_width: int,
-                 vision_patch_size: int,
-                 # text
-                 context_length: int,
-                 vocab_size: int,
-                 transformer_width: int,
-                 transformer_heads: int,
-                 transformer_layers: int
-                 ):
+    def __init__(
+        self,
+        embed_dim: int,
+        # vision
+        image_resolution: int,
+        vision_layers: Union[Tuple[int, int, int, int], int],
+        vision_width: int,
+        vision_patch_size: int,
+        # text
+        context_length: int,
+        vocab_size: int,
+        transformer_width: int,
+        transformer_heads: int,
+        transformer_layers: int,
+        moe_layers: list = None,
+    ):
         super().__init__()
 
         self.context_length = context_length
 
         if isinstance(vision_layers, (tuple, list)):
             vision_heads = vision_width * 32 // 64
-            self.visual = ModifiedResNet(
-                layers=vision_layers,
-                output_dim=embed_dim,
-                heads=vision_heads,
-                input_resolution=image_resolution,
-                width=vision_width
-            )
+            self.visual = ModifiedResNet(layers=vision_layers, output_dim=embed_dim, heads=vision_heads, input_resolution=image_resolution, width=vision_width)
         else:
             vision_heads = vision_width // 64
-            self.visual = VisionTransformer(
+            self.visual = MoEVisionTransformer(
                 input_resolution=image_resolution,
                 patch_size=vision_patch_size,
                 width=vision_width,
                 layers=vision_layers,
                 heads=vision_heads,
-                output_dim=embed_dim
+                output_dim=embed_dim,
+                moe_layers=moe_layers,
             )
 
-        self.transformer = Transformer(
-            width=transformer_width,
-            layers=transformer_layers,
-            heads=transformer_heads,
-            attn_mask=self.build_attention_mask()
-        )
+        self.transformer = Transformer(width=transformer_width, layers=transformer_layers, heads=transformer_heads, attn_mask=self.build_attention_mask())
 
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
@@ -302,7 +378,7 @@ class CLIP(nn.Module):
 
         if isinstance(self.visual, ModifiedResNet):
             if self.visual.attnpool is not None:
-                std = self.visual.attnpool.c_proj.in_features ** -0.5
+                std = self.visual.attnpool.c_proj.in_features**-0.5
                 nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
                 nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std)
                 nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std)
@@ -313,8 +389,8 @@ class CLIP(nn.Module):
                     if name.endswith("bn3.weight"):
                         nn.init.zeros_(param)
 
-        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
-        attn_std = self.transformer.width ** -0.5
+        proj_std = (self.transformer.width**-0.5) * ((2 * self.transformer.layers) ** -0.5)
+        attn_std = self.transformer.width**-0.5
         fc_std = (2 * self.transformer.width) ** -0.5
         for block in self.transformer.resblocks:
             nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
@@ -323,7 +399,7 @@ class CLIP(nn.Module):
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
         if self.text_projection is not None:
-            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+            nn.init.normal_(self.text_projection, std=self.transformer.width**-0.5)
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -411,7 +487,7 @@ def build_model(state_dict: dict):
         vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
         output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
         vision_patch_size = None
-        assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
+        assert output_width**2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
         image_resolution = output_width * 32
 
     embed_dim = state_dict["text_projection"].shape[1]
@@ -420,17 +496,58 @@ def build_model(state_dict: dict):
     transformer_width = state_dict["ln_final.weight"].shape[0]
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
-
+    moe_layer = ["F"] * 8 + ["S", "F"] * 2
     model = CLIP(
         embed_dim,
-        image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
+        image_resolution,
+        vision_layers,
+        vision_width,
+        vision_patch_size,
+        context_length,
+        vocab_size,
+        transformer_width,
+        transformer_heads,
+        transformer_layers,
+        moe_layers=moe_layer,
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
 
-    convert_weights(model)
-    model.load_state_dict(state_dict)
+    # convert_weights(model)
+    # remove ffn in pretrained weights to align with MoE models
+    removed_index = []
+    for i, block in enumerate(model.visual.transformer.resblocks.children()):
+        if hasattr(block.mlp, "experts"):
+            removed_index.append(i)
+            num_experts = block.mlp.num_global_experts
+            ## for weights
+            hidden_dim, input_dim = state_dict[f"visual.transformer.resblocks.{i}.mlp.c_fc.weight"].shape
+            state_dict[f"visual.transformer.resblocks.{i}.mlp.experts.batched_fc1_w"] = state_dict[f"visual.transformer.resblocks.{i}.mlp.c_fc.weight"].expand(
+                num_experts, hidden_dim, input_dim
+            )
+
+            state_dict[f"visual.transformer.resblocks.{i}.mlp.experts.batched_fc2_w"] = (
+                state_dict[f"visual.transformer.resblocks.{i}.mlp.c_proj.weight"].expand(num_experts, input_dim, hidden_dim).permute(0, 2, 1)
+            )
+            # for bias
+
+            c_fc_bias = state_dict[f"visual.transformer.resblocks.{i}.mlp.c_fc.bias"]
+            stacked_c_fc_bias = c_fc_bias.expand(num_experts, 1, hidden_dim)
+            assert stacked_c_fc_bias.shape == model.visual.transformer.resblocks[i].mlp.experts.batched_fc1_bias.shape
+            state_dict[f"visual.transformer.resblocks.{i}.mlp.experts.batched_fc1_bias"] = stacked_c_fc_bias
+
+            c_proj_bias = state_dict[f"visual.transformer.resblocks.{i}.mlp.c_proj.bias"]
+            stacked_c_proj_bias = c_proj_bias.expand(num_experts, 1, input_dim)
+            assert stacked_c_proj_bias.shape == model.visual.transformer.resblocks[i].mlp.experts.batched_fc2_bias.shape
+            state_dict[f"visual.transformer.resblocks.{i}.mlp.experts.batched_fc2_bias"] = stacked_c_proj_bias
+
+    key_list = list(state_dict.keys())
+    for item in removed_index:
+        for key in key_list:
+            if f"visual.transformer.resblocks.{item}.mlp.c_" in key:
+                state_dict.pop(key)
+    msg = model.load_state_dict(state_dict, strict=False)
+    print(msg)
     return model.eval()
